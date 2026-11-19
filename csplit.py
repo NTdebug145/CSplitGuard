@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-csplit.py v2.6.0 — 通用 C 源码自动拆分 / 混淆工具（增强版）
+csplit.py v2.6.6 — 通用 C 源码自动拆分 / 混淆工具（修复版）
 
-新增 (v2.6.0):
-  - 6 层字符串加密（3 轮 Feistel）
+修复 (v2.6.6):
+  - junk 注入不再硬编码 ['main','warmup',...]，自动兜底任意 func_def
+  - n_checks==0 的 decoy 文件加 constructor 强引用，防 -flto 死代码删除
+  - ds_get 清零改用 volatile 防止编译器优化掉
+  - 清理 process_file_signatures / _fscheck_block 的重复定义
+  - 删除已无调用方的 inject_junk_checks 单文件版
+  - 新增 --strict-parse / --dry-run
+
+历史 (v2.6.0):
+  - 6 层 Feistel 字符串加密
   - 全局 const char *x[] 数组加密 + constructor 注入
-  - ds_get / j_* / _adbg_* 等内部名随 --obfuscate-symbols 一并混淆
+  - ds_get / j_* / _adbg_* 等内部名随 --obfuscate-symbols 混淆
   - 字符串 ID 随机打散（ds_idx_pos 排列表）
-  - ds_buf 每次访问前清零
   - anti-debug 多检测：TracerPid + /proc/self/maps + LD_PRELOAD
 """
 import os, sys, re, json, argparse, subprocess, random, string
@@ -36,13 +43,29 @@ extern float for goto if inline int long register restrict return short signed
 sizeof static struct switch typedef union unsigned void volatile while _Bool
 _Complex _Imaginary NULL true false size_t ssize_t""".split())
 
-# ================= 字符串字面量扫描（带初始化判定） =================
+def _read_source_file(path):
+    """尝试 utf-8 → utf-8-sig → gbk → latin-1，全失败则退出。"""
+    for enc in ('utf-8', 'utf-8-sig', 'gbk', 'latin-1'):
+        try:
+            with open(path, 'r', encoding=enc) as f:
+                return f.read()
+        except (UnicodeDecodeError, LookupError):
+            continue
+        except OSError as e:
+            print(f'[错误] 读取 {path} 失败: {e}', file=sys.stderr)
+            sys.exit(1)
+    print(f'[错误] 无法解码 {path}（尝试 utf-8/utf-8-sig/gbk/latin-1 均失败）',
+          file=sys.stderr)
+    sys.exit(1)
+
+# ================= 字符串字面量扫描 =================
 def _find_string_positions(text):
-    """返回 [(start, end, content, is_init), ...]"""
     results = []
     n = len(text); i = 0
     bracket_stack = []
     prev_tok = ''
+    # 额外追踪：最近一次 '=' 之前最后 1~3 个 token，用于判断是否数组声明
+    prev_tokens = []
     while i < n:
         c = text[i]
         if c == '/' and i + 1 < n:
@@ -57,23 +80,57 @@ def _find_string_positions(text):
                 if text[j] == '"':  j += 1; break
                 j += 1
             in_brace = bool(bracket_stack) and bracket_stack[-1] == '{'
-            is_init = (prev_tok == '=') or (in_brace and prev_tok in ('{', ','))
+
+            # === 新的 is_init 判定 ===
+            # 只有以下情况才算"必须编译期常量"：
+            #   (a) 函数体内 `{ "x", "y" }` 数组字面量：prev_tok == '{' 或 ','
+            #   (b) `T[] = "abc"` 类型数组声明：prev_tok == '=' 且 prev_tokens 末尾有 ']'
+            is_init = False
+            if in_brace and prev_tok in ('{', ','):
+                is_init = True
+            elif prev_tok == '=':
+                # 看 '=' 之前的 token 序列：是否形如 `char x[N] =` / `T[] =`
+                # 取 prev_tokens 最后 1~3 个
+                tail = prev_tokens[-3:] if len(prev_tokens) >= 1 else []
+                # 有 ']' 说明是数组声明
+                if ']' in tail:
+                    is_init = True
+
             results.append((i, j, text[i + 1:j - 1], is_init))
-            prev_tok = '"'; i = j; continue
+            prev_tok = '"'
+            prev_tokens.append('"')
+            i = j; continue
+
         if c == '\'':
             j = i + 1
             while j < n:
                 if text[j] == '\\': j += 2; continue
                 if text[j] == '\'': j += 1; break
                 j += 1
-            prev_tok = '\''; i = j; continue
+            prev_tok = '\''
+            prev_tokens.append('\'')
+            if len(prev_tokens) > 8: prev_tokens = prev_tokens[-8:]
+            i = j; continue
+
         if c in '([{':
             bracket_stack.append(c); prev_tok = c
+            prev_tokens.append(c)
         elif c in ')]}':
             if bracket_stack: bracket_stack.pop()
             prev_tok = c
+            prev_tokens.append(c)
+        elif c.isalnum() or c == '_':
+            # 标识符：作为一个 token 收集
+            k = i
+            while k < n and (text[k].isalnum() or text[k] == '_'): k += 1
+            prev_tokens.append(text[i:k])
+            prev_tok = text[i]  # 用一个非空白字符示意
+            i = k; continue
         elif c not in ' \t\r\n':
             prev_tok = c
+            prev_tokens.append(c)
+
+        if len(prev_tokens) > 8: prev_tokens = prev_tokens[-8:]
         i += 1
     return results
 
@@ -114,12 +171,10 @@ def gen_junk_h(outdir, fname, ck_name, panic_name, sym_map=None, basename='junk'
     _write(outdir, fname, '\n'.join(L) + '\n', sym_map or {})
 
 def gen_junk_c(outdir, fname, n_checks, seed, table, expected,
-               panic_code, ck_name, panic_name, sym_map=None):
-    """v2.6.4 — 诊断字符串加密 + 支持 n_checks == 0 的纯干扰文件。"""
-    # ---- 边界：n_checks == 0 生成纯干扰模块 ----
+               panic_code, ck_name, panic_name, sym_map=None, ctor_base=200):
     if n_checks == 0:
         L = [
-            '/* auto-generated — junk v2.6.4 (dummy decoy, 0 checks) */',
+            '/* auto-generated — junk decoy (0 checks, LTO-safe) */',
             '#include <stdint.h>',
             '#include <stdlib.h>',
             '#include <unistd.h>',
@@ -129,12 +184,18 @@ def gen_junk_c(outdir, fname, n_checks, seed, table, expected,
             '',
             '__attribute__((noreturn, noinline, used))',
             f'void {panic_name}(void) {{ _Exit({panic_code}); }}',
+            '',
+            '/* 强制引用 ck，防 -flto 当死代码删除 */',
+            f'__attribute__((constructor({ctor_base + 2}), used))',   # 改动
+            f'static void _zkeep_{ck_name}(void) {{',
+            f'    volatile int r = {ck_name}(0);',
+            '    (void)r;',
+            '}',
             ''
         ]
         _write(outdir, fname, '\n'.join(L) + '\n', sym_map or {})
         return
-
-    # ---- 正常路径：n_checks >= 1 ----
+    # —— 以下保持 v2.6.6 原样 ——
     def fmt_u64(xs):
         lines = []
         for i in range(0, len(xs), 4):
@@ -151,7 +212,7 @@ def gen_junk_c(outdir, fname, n_checks, seed, table, expected,
                 + ', '.join(f'0x{b:02x}' for b in bs) + '};')
 
     L = [
-        '/* auto-generated — junk v2.6.4 */',
+        '/* auto-generated — junk v2.6.8 */',
         '#include <stdint.h>',
         '#include <stdlib.h>',
         '#include <stdio.h>',
@@ -250,15 +311,48 @@ def inject_junk_checks_multi(items, targets, junk_modules):
             for (mi, li) in targets[it.name])
         it.text = it.text[:pos] + stmts + it.text[pos:]
 
-def inject_junk_checks(items, targets, ck_name, panic_name):
+def _pick_junk_inject_targets(items, pool_priority):
+    """按优先级选 junk 注入目标，兜底选任意 func_def。
+    返回候选函数名列表（已去重、按优先级排序）。
+    若源码一个 func_def 都没有，返回 []。"""
+    all_funcs = [it.name for it in items if it.kind == 'func_def' and it.name]
+    if not all_funcs:
+        return []
+    result = []
+    for fn in pool_priority:
+        if fn in all_funcs and fn not in result:
+            result.append(fn)
+    # 兜底 1：任意非 static 函数
     for it in items:
-        if it.kind != 'func_def' or it.name not in targets: continue
-        b = find_body_brace(it.text)
-        if b < 0: continue
-        pos = _find_body_inject_pos(it.text, b)
-        stmts = ''.join(f'    if (!{ck_name}({n})) {panic_name}();\n'
-                        for n in targets[it.name])
-        it.text = it.text[:pos] + stmts + it.text[pos:]
+        if it.kind == 'func_def' and it.name and it.name not in result and not it.is_static:
+            result.append(it.name)
+    # 兜底 2：任意 static 函数
+    for it in items:
+        if it.kind == 'func_def' and it.name and it.name not in result:
+            result.append(it.name)
+    return result
+
+def inject_junk_checks_safe(items, n_checks, junk_modules, pool_priority):
+    """v2.6.6 — 健壮版 junk 注入：
+      - 自动选目标函数（不硬编码）
+      - 无可用目标函数时返回空 dict（不崩、不静默坏）
+      - check 数超过函数数时轮流分摊
+      - 返回实际注入的 {fn_name: [(mi, li), ...]}"""
+    if not junk_modules or n_checks <= 0:
+        return {}
+    targets_available = _pick_junk_inject_targets(items, pool_priority)
+    if not targets_available:
+        return {}
+    check_plan = [(mi, li) for mi, jm in enumerate(junk_modules)
+                  for li in range(jm['n'])]
+    if not check_plan:
+        return {}
+    targets = {}
+    for ci, plan in enumerate(check_plan):
+        fn = targets_available[ci % len(targets_available)]
+        targets.setdefault(fn, []).append(plan)
+    inject_junk_checks_multi(items, targets, junk_modules)
+    return targets
 
 # ================= 加密工具 =================
 def _ror3(x): return ((x >> 3) | (x << 5)) & 0xFF
@@ -401,12 +495,12 @@ def _encrypt_one(content, rng, krot):
     enc = bytearray()
     for i, p in enumerate(raw):
         v1 = p ^ key
-        v2 = ((v1 << 3) | (v1 >> 5)) & 0xFF                                   # rot_left_3
+        v2 = ((v1 << 3) | (v1 >> 5)) & 0xFF
         k1 = (krot[(i + s) & 0xF] ^ (i * 37)) & 0xFF
         v3 = (v2 + k1) & 0xFF
         k2 = (krot[(i * 3 + s + 7) & 0xF] ^ ((i * 91 + 13) & 0xFF)) & 0xFF
         v4 = v3 ^ k2
-        v5 = ((v4 >> 5) | (v4 << 3)) & 0xFF                                   # rot_right_5
+        v5 = ((v4 >> 5) | (v4 << 3)) & 0xFF
         c  = (v5 + key) & 0xFF
         enc.append(c)
     return (bytes(enc), key, s)
@@ -414,7 +508,7 @@ def _encrypt_one(content, rng, krot):
 def dump_keys(outdir, krot, unique_strings, encrypted_data, seed):
     path = os.path.join(outdir, 'keys.txt')
     with open(path, 'w') as f:
-        f.write('# csplit.py v2.6.0 key dump\n')
+        f.write('# csplit.py v2.6.6 key dump\n')
         f.write(f'SEED  = {seed}\n')
         f.write(f'KROT  = {",".join(f"0x{b:02x}" for b in krot)}\n#\n')
         f.write('# ID      KEY     SEED    明文预览\n')
@@ -634,32 +728,38 @@ def _is_func_body(head):
     return has and depth == 0
 
 def _extract_real_func_name(sig_text):
-    """
-    从函数签名中提取真实函数名（参数列表左侧最后一个 identifier）。
-    - `static void demo_01_hello(void)`         -> 'demo_01_hello'
-    - `CJSON_PUBLIC(cJSON *) cJSON_Parse(...)`  -> 'cJSON_Parse'
-    - `cJSON_Parse(int (*cb)(void))`            -> 'cJSON_Parse'
-    - `int (*p)(int, int)`                      -> None（函数指针声明，弃用）
-    """
+    """提取真实函数名；v2.6.8 剥离末尾 __attribute__((...))。"""
     s = sig_text.rstrip()
-    while s and s[-1] in ';\n\r\t ': s = s[:-1]
-    if not s.endswith(')'): return None
-    # 从右往左，depth +1 for ')', -1 for '('，配对到最外层 '('
+    while s and s[-1] in ';\n\r\t ':
+        s = s[:-1]
+    # 【新增】剥离末尾 attribute（可能多个）
+    while True:
+        m = re.search(r'\s*__attribute__\s*\(\(.*?\)\)\s*$', s, re.DOTALL)
+        if not m:
+            break
+        s = s[:m.start()].rstrip()
+    if not s.endswith(')'):
+        return None
     depth = 0; i = len(s) - 1
     while i >= 0:
         c = s[i]
-        if c == ')': depth += 1
+        if c == ')':
+            depth += 1
         elif c == '(':
             depth -= 1
-            if depth == 0: break
+            if depth == 0:
+                break
         i -= 1
-    if i < 0: return None
-    # 往前跳空白，取 identifier
+    if i < 0:
+        return None
     j = i - 1
-    while j >= 0 and s[j] in ' \t\r\n': j -= 1
-    if j < 0 or not (s[j].isalnum() or s[j] == '_'): return None
+    while j >= 0 and s[j] in ' \t\r\n':
+        j -= 1
+    if j < 0 or not (s[j].isalnum() or s[j] == '_'):
+        return None
     k = j
-    while k >= 0 and (s[k].isalnum() or s[k] == '_'): k -= 1
+    while k >= 0 and (s[k].isalnum() or s[k] == '_'):
+        k -= 1
     return s[k+1:j+1]
 
 def _looks_like_func_decl(s):
@@ -679,7 +779,7 @@ def classify_code(text, core):
     if brace >= 0:
         head = s[:brace].strip()
         if _is_func_body(head):
-            name = _extract_real_func_name(head)               # ← 改动
+            name = _extract_real_func_name(head)
             it = Item('func_def', text, core); it.name = name
             it.is_static = is_static; it.signature = head
             end = find_matching_brace(s, brace)
@@ -690,13 +790,13 @@ def classify_code(text, core):
     if is_extern:
         it = Item('extern_decl', text, core)
         if '(' in s:
-            it.name = _extract_real_func_name(s)               # ← 改动
+            it.name = _extract_real_func_name(s)
         else:
             it.name = extract_var_name(s)
         return it
     if _looks_like_func_decl(s):
         it = Item('func_decl', text, core)
-        it.name = _extract_real_func_name(s)                   # ← 改动
+        it.name = _extract_real_func_name(s)
         it.is_static = is_static; return it
     it = Item('global', text, core); it.name = extract_var_name(s)
     it.is_static = is_static; return it
@@ -713,7 +813,6 @@ def strip_static_any(text):
     return text
 
 def _add_hidden_visibility(text):
-    """在代码片段第一个非空白字符前插入 __attribute__((visibility("hidden")))。"""
     if not text: return text
     i, n = 0, len(text)
     while i < n and text[i] in ' \t\n\r':
@@ -792,9 +891,6 @@ def compute_edges(items, symbols):
             if jt.group != it.group:
                 group_deps.setdefault(it.group, set()).add(jt.group)
                 users.setdefault(r, set()).add(it.group)
-
-    # 以"名字"为单位判定 export：任何同名 item（func_def / func_decl / global）
-    # 只要被跨组引用，或者对应 func_def 原本非 static，一律 export=True
     name_export = {}
     for it in items:
         if not it.name: continue
@@ -802,7 +898,6 @@ def compute_edges(items, symbols):
             name_export[it.name] = True
         elif not it.is_static and it.kind in ('func_def','global'):
             name_export[it.name] = True
-
     for it in items:
         if it.name and it.name in name_export:
             it.export = name_export[it.name]
@@ -866,12 +961,9 @@ def obfuscate_symbols(items, seed=None, skip_export=False):
         if it.kind not in ('func_def','global','typedef','struct_def','define'): continue
         if it.name in RESERVED or it.name in STD_LIB_SYMBOLS: continue
         if len(it.name) < 2: continue
-        # 包装宏（CJSON_PUBLIC / MYLIB_API / ...）绝不混淆
         if re.search(r'_(PUBLIC|API|EXPORT|DECL|CALL|INLINE)$', it.name): continue
         if skip_export:
             if it.kind == 'define': continue
-            # 关键：只跳过"原本 non-static"的对外 ABI 符号
-            # 原 static 函数（即使跨组 export=True）仍要混淆
             if not it.is_static: continue
         candidates.add(it.name)
     result = {}; used = set()
@@ -886,7 +978,6 @@ def obfuscate_symbols(items, seed=None, skip_export=False):
     return result
 
 def _add_internal_syms(sym_map, names, seed, salt, items):
-    """给生成模块内部名加混淆映射（跳过已有/冲突）。"""
     existing_src = {it.name for it in items if it.name}
     rng = random.Random((seed or 0) ^ salt)
     used = set(sym_map.values()) | set(sym_map.keys())
@@ -951,20 +1042,28 @@ def process_strings_in_items(items, seed=None, krot=None, rng=None):
     return unique, encrypted
 
 def process_global_string_arrays(items, unique, encrypted, krot, rng):
-    """识别 `[static] [const] char *name[N] = { "a", "b", ... };`，加密并登记。"""
+    """v2.6.8：先合并相邻字符串 + 正则支持 char * const[] / char **[]"""
     results = []
     pat = re.compile(
-        r'^(\s*(?:static\s+)?(?:const\s+)?char\s*\*\s*(?!const\b))'
+        r'^(\s*(?:static\s+)?(?:const\s+)?char\s*(?:\*+\s*|\bconst\s+)*)'
         r'([A-Za-z_]\w*)\s*\[\s*(\d*)\s*\]\s*=\s*\{(.*)\}\s*;\s*$',
         re.DOTALL)
     for ii, it in enumerate(items):
-        if it.kind != 'global': continue
+        if it.kind != 'global':
+            continue
+        # P0-2：先合并相邻字符串，避免 "a" "b" 被拆成两个 NULL
+        merged = merge_adjacent_strings(it.text)
+        if merged != it.text:
+            it.text = merged
+            it.core = merged
         s = it.text.strip()
         m = pat.match(s)
-        if not m: continue
+        if not m:
+            continue
         prefix, name, size, init_body = m.groups()
         occs = extract_string_literals(init_body)
-        if not occs: continue
+        if not occs:
+            continue
         ds_ids = []
         new_body = init_body
         repls = []
@@ -986,11 +1085,7 @@ def process_global_string_arrays(items, unique, encrypted, krot, rng):
     return results
 
 def process_file_signatures(groups, unique, encrypted, krot, rng):
-    """
-    为每个 group 生成 16B sentinel + FNV-1a 64 hash（hex 字符串）。
-    hash 走字符串加密机制（复用 _encrypt_one），
-    返回 {group: {'sentinel': bytes, 'ds_id': int}}
-    """
+    """为每个 group 生成 16B sentinel + FNV-1a 64 hash（hex 字符串）。"""
     result = {}
     for g in sorted(groups):
         sentinel = bytes(rng.randint(0, 255) for _ in range(16))
@@ -1005,27 +1100,7 @@ def process_file_signatures(groups, unique, encrypted, krot, rng):
         result[g] = {'sentinel': sentinel, 'ds_id': unique[hex_str]}
     return result
 
-def process_file_signatures(groups, unique, encrypted, krot, rng):
-    """
-    为每个 group 生成 16B sentinel + FNV-1a 64 hash（hex）。
-    hash 走现有字符串加密机制（复用 _encrypt_one），返回 {group: {'sentinel', 'ds_id'}}
-    """
-    result = {}
-    for g in sorted(groups):
-        sentinel = bytes(rng.randint(0, 255) for _ in range(16))
-        h = 0xcbf29ce484222325
-        for b in sentinel:
-            h ^= b
-            h = (h * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
-        hex_str = f'{h:016x}'
-        if hex_str not in unique:
-            unique[hex_str] = len(unique)
-            encrypted[unique[hex_str]] = _encrypt_one(hex_str, rng, krot)
-        result[g] = {'sentinel': sentinel, 'ds_id': unique[hex_str]}
-    return result
-
-def _fscheck_block(group_name, sig_info):
-    """生成 <group>.c 末尾的文件签名自校验代码块。"""
+def _fscheck_block(group_name, sig_info, ctor_base=201):
     if not sig_info:
         return []
     safe_g = re.sub(r'\W', '_', group_name)
@@ -1036,34 +1111,7 @@ def _fscheck_block(group_name, sig_info):
         '/* auto-generated: file signature check */',
         f'static volatile const unsigned char _fsig_{safe_g}[16] = {{ {sent_str} }};',
         '',
-        '__attribute__((noinline, constructor(201)))',
-        f'static void _fscheck_{safe_g}(void) {{',
-        '    unsigned long long h = 0xcbf29ce484222325ULL;',
-        f'    for (int i = 0; i < 16; i++) {{ h ^= _fsig_{safe_g}[i]; h *= 0x100000001b3ULL; }}',
-        f'    char *p = ds_get({ds_id});',
-        '    unsigned long long exp = 0;',
-        '    for (int i = 0; i < 16; i++) {',
-        "        int v = (p[i] <= '9') ? (p[i] - '0') : (p[i] - 'a' + 10);",
-        '        exp = (exp << 4) | (unsigned long long)v;',
-        '    }',
-        '    if (h != exp) _Exit(4);',
-        '}',
-        '',
-    ]
-
-def _fscheck_block(group_name, sig_info):
-    """生成 <group>.c 末尾的文件签名自校验代码块。"""
-    if not sig_info:
-        return []
-    safe_g = re.sub(r'\W', '_', group_name)
-    sentinel = sig_info['sentinel']
-    ds_id    = sig_info['ds_id']
-    sent_str = ', '.join(f'0x{b:02x}' for b in sentinel)
-    return [
-        '/* auto-generated: file signature check */',
-        f'static volatile const unsigned char _fsig_{safe_g}[16] = {{ {sent_str} }};',
-        '',
-        '__attribute__((noinline, constructor(201)))',
+        f'__attribute__((noinline, constructor({ctor_base})))',
         f'static void _fscheck_{safe_g}(void) {{',
         '    unsigned long long h = 0xcbf29ce484222325ULL;',
         f'    for (int i = 0; i < 16; i++) {{ h ^= _fsig_{safe_g}[i]; h *= 0x100000001b3ULL; }}',
@@ -1132,7 +1180,6 @@ def gen_decrypt_c(outdir, fname, unique_strings, encrypted_data, krot,
             f.write('/* empty */\n')
         return
 
-    # 1) 原始顺序数据
     orig_off, orig_len, orig_key, orig_seed, orig_data = [], [], [], [], []
     max_len = 1
     for i in range(N):
@@ -1142,15 +1189,13 @@ def gen_decrypt_c(outdir, fname, unique_strings, encrypted_data, krot,
         orig_data.extend(enc)
         if len(enc) > max_len: max_len = len(enc)
 
-    # 2) ID 打散
     rng_idx = random.Random(((seed or 0) ^ 0x5EC4) & 0xFFFFFFFF)
     P = list(range(N))
-    rng_idx.shuffle(P)                            # P[n] = DS_n 的存储位置
+    rng_idx.shuffle(P)
     inv_P = [0] * N
     for i in range(N):
-        inv_P[P[i]] = i                           # inv_P[j] = 存储位置 j 上的 DS_id
+        inv_P[P[i]] = i
 
-    # 3) 按存储顺序组织
     ds_off = [0] * N; ds_len = [0] * N
     ds_key = [0] * N; ds_seed = [0] * N; ds_data = []
     for j in range(N):
@@ -1174,7 +1219,7 @@ def gen_decrypt_c(outdir, fname, unique_strings, encrypted_data, krot,
     perm_str = ', '.join(str(p) for p in P)
 
     L = [
-        '/* auto-generated — decrypt v2.6.0 (6-layer) */', '',
+        '/* auto-generated — decrypt v2.6.6 (6-layer) */', '',
         f'static const unsigned char ds_data[{max(len(ds_data),1)}] = {{',
         fmt_bytes(ds_data), '};', '',
         f'static const int ds_off[{N}] = {{', fmt_ints(ds_off), '};', '',
@@ -1192,7 +1237,8 @@ def gen_decrypt_c(outdir, fname, unique_strings, encrypted_data, krot,
         '    int off = ds_off[r], len = ds_len[r];',
         '    unsigned char key = ds_key[r];',
         '    unsigned char s   = ds_seed[r];',
-        '    for (int i = 0; i < len + 1; i++) ds_buf[n][i] = 0;',
+        # v2.6.6: 用 volatile 防止编译器优化掉清零
+        '    for (int i = 0; i < len + 1; i++) ((volatile char*)ds_buf[n])[i] = 0;',
         '    for (int i = 0; i < len; i++) {',
         '        unsigned char v = ds_data[off + i];',
         '        unsigned char k1 = (unsigned char)(kRot[(i + s) & 0xF] ^ (i * 37));',
@@ -1224,22 +1270,18 @@ def gen_antidebug_h(outdir, fname, sym_map=None):
          '#endif', '']
     _write(outdir, fname, '\n'.join(L) + '\n', sym_map or {})
 
-def gen_antidebug_c(outdir, fname, sym_map=None):
-    """anti-debug v2.6.2 — Termux/Android 兼容：
-       - constructor(65535) —— Bionic 上 libc 完全初始化后再执行
-       - 所有字符串（含调试文案）都加密，r2 izz 零情报
-       - CSPLIT_NO_ADBG=1 关闭；CSPLIT_ADBG_DEBUG=1 输出诊断
-    """
+def gen_antidebug_c(outdir, fname, sym_map=None,
+                    features=None, adbg_priority=65535):
+    """anti-debug v2.6.8 — features 动态、priority 可调、Termux-safe"""
+    if not features:
+        features = ['frida-agent', 'libfrida-', 'gdb-server', 'libhook', 'frida']
+
     def enc(s, k): return [b ^ k for b in s]
 
-    # 加密字符串表（路径、格式、特征、调试、开关名）
     E = {
         '_a_pst':  (b'/proc/self/status',   0x13),
         '_a_pmp':  (b'/proc/self/maps',     0x37),
         '_a_fmt':  (b'TracerPid: %d',       0x5A),
-        '_a_ffr1': (b'frida-agent',         0x23),
-        '_a_ffr2': (b'libfrida-',           0x31),
-        '_a_fgv':  (b'gdb-server',          0x42),
         '_a_fhk':  (b'libhook',             0x61),
         '_a_fr':   (b'frida',               0x24),
         '_a_noad': (b'CSPLIT_NO_ADBG',      0x4D),
@@ -1252,94 +1294,106 @@ def gen_antidebug_c(outdir, fname, sym_map=None):
         '_a_nul':  (b'(null)',               0x6B),
     }
 
+    feat_entries = []
+    for idx, feat in enumerate(features):
+        key = ((0x20 + idx * 0x11) & 0xFF) or 0x42
+        name = f'_a_ft{idx}'
+        feat_entries.append((name, feat.encode(), key))
+
     def arr(name, bs):
         return (f'static const unsigned char {name}[{len(bs)}] = {{'
                 + ', '.join(f'0x{b:02x}' for b in bs) + '};')
 
     L = [
-        '/* auto-generated — anti-debug v2.6.2 (Termux-safe) */',
+        '/* auto-generated — anti-debug v2.6.8 (Termux-safe) */',
         '#include <stdio.h>',
         '#include <stdlib.h>',
         '#include <string.h>',
         '#include <unistd.h>',
         '',
     ]
-    # 加密数据数组
     for name, (s, k) in E.items():
         L.append(arr(name, enc(s, k)))
+    for name, data, k in feat_entries:
+        L.append(arr(name, [b ^ k for b in data]))
     L.append('')
 
-    # 明文缓冲区
     for name in E:
         sz = max(len(enc(*E[name])), 32) + 4
         L.append(f'static char _b{name}[{sz}];')
-    L += [
-        'static int _a_state = -1;',   # -1 = 未探测；0 = 正常；1 = 关闭；2 = debug
-        '',
-        '__attribute__((noinline))',
-        'static void _a_dec(unsigned char *d, const unsigned char *s,',
-        '                   int n, unsigned char k) {',
-        '    volatile unsigned char t;',
-        '    for (int i = 0; i < n; i++) { t = s[i]; d[i] = (char)(t ^ k); }',
-        '    d[n] = 0;',
-        '}', '',
-        # 用一个 __attribute__((constructor(65535))) 的“延迟探测”函数完成全部检测
-        # —— 此时 libc 已经 __libc_init 完成，fopen/getenv/sscanf 均可用
-        '__attribute__((constructor(65535)))',
-        'static void _a_probe(void) {',
-        '    volatile int dbg = 0;',
-        '    /* 解密所有字符串 */',
-    ]
+    for name, data, k in feat_entries:
+        sz = max(len(data), 32) + 4
+        L.append(f'static char _b{name}[{sz}];')
+    L.append('static int _a_state = -1;')
+    L.append('')
+    L.append('__attribute__((noinline))')
+    L.append('static void _a_dec(unsigned char *d, const unsigned char *s,')
+    L.append('                   int n, unsigned char k) {')
+    L.append('    volatile unsigned char t;')
+    L.append('    for (int i = 0; i < n; i++) { t = s[i]; d[i] = (char)(t ^ k); }')
+    L.append('    d[n] = 0;')
+    L.append('}')
+    L.append('')
+    L.append(f'__attribute__((constructor({adbg_priority})))')
+    L.append('static void _a_probe(void) {')
+    L.append('    volatile int dbg = 0;')
     for name, (s, k) in E.items():
         L.append(f'    _a_dec((unsigned char*)_b{name}, {name}, '
                  f'sizeof({name}), 0x{k:02x});')
-    L += [
-        '',
-        '    /* 读取开关：CSPLIT_NO_ADBG=1 关闭，CSPLIT_ADBG_DEBUG=1 诊断 */',
-        '    const char *v1 = getenv(_b_a_noad);',
-        '    const char *v2 = getenv(_b_a_dbg);',
-        '    int disabled = (v1 && v1[0] == \'1\');',
-        '    int debug    = (v2 && v2[0] == \'1\');',
-        '    _a_state = disabled ? 1 : 0;',
-        '    if (disabled) return;',
-        '',
-        '    /* 1) TracerPid */',
-        '    FILE *f = fopen(_b_a_pst, "r");',
-        '    if (f) {',
-        '        char buf[256]; int pid = 0;',
-        '        while (fgets(buf, sizeof(buf), f))',
-        '            if (sscanf(buf, _b_a_fmt, &pid) == 1) break;',
-        '        fclose(f);',
-        '        if (debug) fprintf(stderr, _b_a_mtp, pid);',
-        '        if (pid != 0) _Exit(1);',
-        '    } else if (debug) {',
-        '        fprintf(stderr, _b_a_mno, _b_a_pst);',
-        '    }',
-        '',
-        '    /* 2) /proc/self/maps 精确匹配 */',
-        '    f = fopen(_b_a_pmp, "r");',
-        '    if (f) {',
-        '        char buf[1024]; int hit = 0;',
-        '        while (fgets(buf, sizeof(buf), f)) {',
-        '            if (strstr(buf, _b_a_ffr1) || strstr(buf, _b_a_ffr2) ||',
-        '                strstr(buf, _b_a_fgv)) {',
-        '                if (debug) fprintf(stderr, _b_a_mhit, buf);',
-        '                hit = 1; break;',
-        '            }',
-        '        }',
-        '        fclose(f);',
-        '        if (hit) _Exit(2);',
-        '    } else if (debug) {',
-        '        fprintf(stderr, _b_a_mno, _b_a_pmp);',
-        '    }',
-        '',
-        '    /* 3) LD_PRELOAD 精确匹配（Termux libtermux-exec.so 不触发） */',
-        '    const char *lp = getenv(_b_a_pre);',
-        '    if (debug) fprintf(stderr, _b_a_mld, lp ? lp : _b_a_nul);',
-        '    if (lp && (strstr(lp, _b_a_fhk) || strstr(lp, _b_a_fr))) _Exit(3);',
-        '}',
-        ''
-    ]
+    for name, data, k in feat_entries:
+        L.append(f'    _a_dec((unsigned char*)_b{name}, {name}, '
+                 f'sizeof({name}), 0x{k:02x});')
+    L.append('')
+    L.append('    const char *v1 = getenv(_b_a_noad);')
+    L.append('    const char *v2 = getenv(_b_a_dbg);')
+    L.append('    int disabled = (v1 && v1[0] == \'1\');')
+    L.append('    int debug    = (v2 && v2[0] == \'1\');')
+    L.append('    _a_state = disabled ? 1 : 0;')
+    L.append('    if (disabled) return;')
+    L.append('')
+    # TracerPid
+    L.append('    FILE *f = fopen(_b_a_pst, "r");')
+    L.append('    if (f) {')
+    L.append('        char buf[256]; int pid = 0;')
+    L.append('        while (fgets(buf, sizeof(buf), f))')
+    L.append('            if (sscanf(buf, _b_a_fmt, &pid) == 1) break;')
+    L.append('        fclose(f);')
+    L.append('        if (debug) fprintf(stderr, _b_a_mtp, pid);')
+    L.append('        if (pid != 0) _Exit(1);')
+    L.append('    } else if (debug) {')
+    L.append('        fprintf(stderr, _b_a_mno, _b_a_pst);')
+    L.append('    }')
+    L.append('')
+    # maps（动态 features）
+    if feat_entries:
+        L.append('    f = fopen(_b_a_pmp, "r");')
+        L.append('    if (f) {')
+        L.append('        char buf[1024]; int hit = 0;')
+        L.append('        while (fgets(buf, sizeof(buf), f)) {')
+        conds = [f'strstr(buf, _b{name})' for name, _, _ in feat_entries]
+        if len(conds) == 1:
+            L.append(f'            if ({conds[0]}) {{')
+        else:
+            L.append(f'            if ({conds[0]}')
+            for c in conds[1:]:
+                L.append(f'                || {c}')
+            L.append('            ) {')
+        L.append('                if (debug) fprintf(stderr, _b_a_mhit, buf);')
+        L.append('                hit = 1; break;')
+        L.append('            }')
+        L.append('        }')
+        L.append('        fclose(f);')
+        L.append('        if (hit) _Exit(2);')
+        L.append('    } else if (debug) {')
+        L.append('        fprintf(stderr, _b_a_mno, _b_a_pmp);')
+        L.append('    }')
+        L.append('')
+    # LD_PRELOAD（固定 frida / libhook）
+    L.append('    const char *lp = getenv(_b_a_pre);')
+    L.append('    if (debug) fprintf(stderr, _b_a_mld, lp ? lp : _b_a_nul);')
+    L.append('    if (lp && (strstr(lp, _b_a_fhk) || strstr(lp, _b_a_fr))) _Exit(3);')
+    L.append('}')
+    L.append('')
     _write(outdir, fname, '\n'.join(L) + '\n', sym_map or {})
 
 # ================= 通用/组/入口生成 =================
@@ -1376,11 +1430,12 @@ def gen_common_h(items, outdir, fname, sym_map,
     L += ['', '#endif', '']
     _write(outdir, fname, '\n'.join(L) + '\n', sym_map)
 
-def _gsinit_block(global_arrays, group_name):
+def _gsinit_block(global_arrays, group_name, ctor_base=200):
     garrs = [ga for ga in (global_arrays or []) if ga.get('group') == group_name]
-    if not garrs: return []
+    if not garrs:
+        return []
     L = ['/* auto-generated: global string init */',
-         '__attribute__((constructor(200)))',
+         f'__attribute__((constructor({ctor_base})))',
          f'static void _gsinit__{re.sub(r"[^A-Za-z0-9_]", "_", group_name)}(void) {{']
     for ga in garrs:
         for i, ds_id in enumerate(ga['ds_ids']):
@@ -1389,7 +1444,7 @@ def _gsinit_block(global_arrays, group_name):
     return L
 
 def gen_common_c(items, outdir, fname, common_h_name, sym_map,
-                 global_arrays=None, file_sigs=None):
+                 global_arrays=None, file_sigs=None, ctor_base=200):
     proto_lines = []; body = []
     for it in items:
         if it.group != 'common': continue
@@ -1416,9 +1471,9 @@ def gen_common_c(items, outdir, fname, common_h_name, sym_map,
     if proto_lines:
         L.extend(proto_lines); L.append('')
     L.extend(body)
-    L.extend(_gsinit_block(global_arrays, 'common'))
+    L.extend(_gsinit_block(global_arrays, 'common', ctor_base))
     if file_sigs and 'common' in file_sigs:
-        L.extend(_fscheck_block('common', file_sigs['common']))
+        L.extend(_fscheck_block('common', file_sigs['common'], ctor_base + 1))
     _write(outdir, fname, '\n'.join(L) + '\n', sym_map)
     return True
 
@@ -1449,7 +1504,7 @@ def gen_group_h(g, items, group_deps, outdir, fname, file_map, sym_map):
     _write(outdir, fname, '\n'.join(L) + '\n', sym_map)
 
 def gen_group_c(g, items, outdir, fname, gh_name, sym_map,
-                global_arrays=None, file_sigs=None):
+                global_arrays=None, file_sigs=None, ctor_base=200):
     L = [f'/* auto-generated: {g} */', f'#include "{gh_name}"']
     if file_sigs and g in file_sigs:
         L.append('#include <stdlib.h>')
@@ -1461,9 +1516,9 @@ def gen_group_c(g, items, outdir, fname, gh_name, sym_map,
             txt = strip_static_any(txt)
             txt = _add_hidden_visibility(txt)
         L.append(txt); L.append('')
-    L.extend(_gsinit_block(global_arrays, g))
+    L.extend(_gsinit_block(global_arrays, g, ctor_base))
     if file_sigs and g in file_sigs:
-        L.extend(_fscheck_block(g, file_sigs[g]))
+        L.extend(_fscheck_block(g, file_sigs[g], ctor_base + 1))
     _write(outdir, fname, '\n'.join(L) + '\n', sym_map)
 
 # ================= 环境检测 / Makefile / Standalone =================
@@ -1487,6 +1542,7 @@ def gen_makefile(outdir, ldflags, elf_name, cflags_extra='', ldflags_extra='',
     with open(os.path.join(outdir, 'Makefile'), 'w') as f:
         f.write(f"""# auto-generated by csplit.py
 CC       ?= cc
+OBJCOPY  ?= objcopy
 SRC_DIR  ?= {src_dir_rel}
 CFLAGS   ?= -O2 -Wall -Wno-format-security -I. -I$(SRC_DIR){cflags_extra}
 DEPFLAGS := -MMD -MP
@@ -1500,7 +1556,9 @@ TARGET   := {elf_name}
 all: $(TARGET)
 
 $(TARGET): $(OBJ)
-\t$(CC) $(CFLAGS) $(OBJ) -o $@ $(LDFLAGS)
+\t$(CC) $(CFLAGS) $(OBJ) -o $@.tmp $(LDFLAGS)
+\t$(OBJCOPY) --remove-section=.comment --remove-section=.note.gnu.build-id $@.tmp $@
+\trm -f $@.tmp
 
 %.o: %.c
 \t$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
@@ -1586,7 +1644,7 @@ def verify(original, outdir, cc, cflags, ldflags, elf_name='split.elf',
            cflags_extra='', ldflags_extra='', library=False):
     src_dir = os.path.dirname(os.path.abspath(original))
     if not ldflags:
-        items = scan_items(open(original, encoding='utf-8').read())
+        items = scan_items(_read_source_file(original))     # 改动
         ldflags = detect_ldflags(items)
     full_c = (cflags + ' ' + cflags_extra + ' -Wno-format-security').split()
     full_l = (ldflags + ' ' + ldflags_extra).split()
@@ -1645,7 +1703,7 @@ def verify(original, outdir, cc, cflags, ldflags, elf_name='split.elf',
 # ================= 主流程 =================
 def main():
     ap = argparse.ArgumentParser(
-        description='csplit.py v2.6.5',
+        description='csplit.py v2.6.6',
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('input')
     ap.add_argument('-o','--output', default='split_out')
@@ -1659,6 +1717,10 @@ def main():
     ap.add_argument('--standalone', action='store_true')
     ap.add_argument('--library', action='store_true',
                     help='输入是库（无 main），编译为 .so 不要求可执行文件')
+    ap.add_argument('--strict-parse', action='store_true',
+                    help='扫描未完整覆盖原文时直接报错退出（默认只警告）')
+    ap.add_argument('--dry-run', action='store_true',
+                    help='只分析不生成任何文件（用于快速验证解析）')
     ap.add_argument('--cc', default='cc')
     ap.add_argument('--cflags', default='-O2')
     ap.add_argument('--ldflags', default='')
@@ -1678,15 +1740,29 @@ def main():
     ap.add_argument('--junk-panic-code', type=lambda x: int(x, 0), default=0xDEAD)
     ap.add_argument('--junk-files', type=int, default=1,
                     help='垃圾 C 文件数量（默认 1）；总校验点 = --junk-checks，均分到各文件')
+    ap.add_argument('--constructor-base', type=int, default=200,
+                    help='constructor 起始优先级（默认 200）；'
+                         'gsinit=base, fscheck=base+1, junk-decoy=base+2')
+    ap.add_argument('--adbg-priority', type=int, default=65535,
+                    help='anti-debug constructor 优先级（默认 65535）；'
+                         '若用户源码自定义了 65535 的 constructor，改此值避开冲突')
+    ap.add_argument('--adbg-features', type=str,
+                    default='frida-agent,libfrida-,gdb-server,libhook,frida',
+                    help='anti-debug /proc/self/maps 检测特征（逗号分隔）')
     a = ap.parse_args()
 
     if a.obfuscate_all:
         a.obfuscate = a.obfuscate_symbols = a.obfuscate_target = True
 
-    with open(a.input, encoding='utf-8') as f: src = f.read()
+    src = _read_source_file(a.input)
     items = scan_items(src)
     if ''.join(it.text for it in items) != src:
-        print('[警告] 扫描未完整覆盖原文', file=sys.stderr)
+        msg = '[警告] 扫描未完整覆盖原文（部分代码可能被遗漏或顺序错乱）'
+        if a.strict_parse:
+            print(f'[错误] {msg}；--strict-parse 下拒绝继续', file=sys.stderr)
+            sys.exit(2)
+        else:
+            print(msg, file=sys.stderr)
     symbols = analyze_deps(items)
 
     # ---- Junk ----
@@ -1694,18 +1770,15 @@ def main():
     if a.junk:
         n_junk_files = max(1, a.junk_files)
         existing = {it.name for it in items if it.name}
-    
         for j in range(n_junk_files):
             jk_rng = random.Random(((a.seed or 0) ^ 0xC5A1) + j * 0x9E3779B1)
             jk_table = [jk_rng.randint(0, 255) for _ in range(16)]
             jk_seed  = jk_rng.getrandbits(64)
-    
             base  = a.junk_checks // n_junk_files
             extra = 1 if j < (a.junk_checks % n_junk_files) else 0
             n_checks_this = base + extra
             jk_expected = [_jk_compute(i, jk_seed, jk_table)
                            for i in range(n_checks_this)]
-    
             while True:
                 ck = '_z' + ''.join(random.choices(string.ascii_lowercase, k=6))
                 if ck not in existing:
@@ -1714,33 +1787,21 @@ def main():
                 panic = '_z' + ''.join(random.choices(string.ascii_lowercase, k=6))
                 if panic not in existing and panic != ck:
                     existing.add(panic); break
-    
             basename = 'junk' if j == 0 else f'junk{j}'
             junk_modules.append({
-                'basename': basename,
-                'ck': ck,
-                'panic': panic,
-                'n': n_checks_this,
-                'seed': jk_seed,
-                'table': jk_table,
-                'expected': jk_expected,
+                'basename': basename, 'ck': ck, 'panic': panic,
+                'n': n_checks_this, 'seed': jk_seed,
+                'table': jk_table, 'expected': jk_expected,
                 'panic_code': a.junk_panic_code,
             })
-    
-        # 把校验点 (module_idx, local_idx) 分配到不同函数
-        check_plan = [(mi, li) for mi, jm in enumerate(junk_modules)
-                      for li in range(jm['n'])]
+
+        # v2.6.6: 安全注入（不硬编码 pool，兜底任意 func_def）
         pool = ['main', 'warmup', 'do_login', 'do_sign', 'parse_sign']
-        fn_targets = [fn for fn in pool
-                      if any(it.kind == 'func_def' and it.name == fn
-                             for it in items)]
-    
-        targets = {}
-        for ci, plan in enumerate(check_plan):
-            fn = fn_targets[ci] if ci < len(fn_targets) else 'main'
-            targets.setdefault(fn, []).append(plan)
-    
-        inject_junk_checks_multi(items, targets, junk_modules)
+        n_total = sum(jm['n'] for jm in junk_modules)
+        injected = inject_junk_checks_safe(items, n_total, junk_modules, pool)
+        if not injected and n_total > 0:
+            print(f'\n[警告] junk 校验无可用注入点（源码无任何函数），'
+                  f'junk 模块仅作编译噪音', file=sys.stderr)
 
     if a.map:
         with open(a.map, encoding='utf-8') as f: apply_map(items, json.load(f))
@@ -1819,17 +1880,26 @@ def main():
                               '_j_inited','_j_debug','_j_prepare']
             for jm in junk_modules:
                 junk_internals.extend([jm['ck'], jm['panic']])
+                if jm['n'] == 0:
+                    # v2.6.6: decoy 文件里的 constructor 也要混淆
+                    junk_internals.append(f'_zkeep_{jm["ck"]}')
             _add_internal_syms(sym_map, junk_internals, a.seed, 0x7A, items)
         if a.anti_debug:
-            _add_internal_syms(sym_map,
-                ['_a_pst','_a_pmp','_a_fmt','_a_ffr1','_a_ffr2','_a_fgv',
-                 '_a_fhk','_a_fr','_a_noad','_a_dbg','_a_pre',
-                 '_a_mhit','_a_mno','_a_mtp','_a_mld','_a_nul',
-                 '_b_a_pst','_b_a_pmp','_b_a_fmt','_b_a_ffr1','_b_a_ffr2',
-                 '_b_a_fgv','_b_a_fhk','_b_a_fr','_b_a_noad','_b_a_dbg',
-                 '_b_a_pre','_b_a_mhit','_b_a_mno','_b_a_mtp','_b_a_mld','_b_a_nul',
-                 '_a_state','_a_dec','_a_probe'],
-                a.seed, 0x3B, items)
+            adbg_feats_obf = [f.strip() for f in a.adbg_features.split(',') if f.strip()]
+            if not adbg_feats_obf:
+                adbg_feats_obf = ['frida-agent','libfrida-','gdb-server','libhook','frida']
+            adbg_names = ['_a_pst','_a_pmp','_a_fmt','_a_fhk','_a_fr',
+                          '_a_noad','_a_dbg','_a_pre',
+                          '_a_mhit','_a_mno','_a_mtp','_a_mld','_a_nul',
+                          '_a_state','_a_dec','_a_probe']
+            for n in ['_a_pst','_a_pmp','_a_fmt','_a_fhk','_a_fr',
+                      '_a_noad','_a_dbg','_a_pre',
+                      '_a_mhit','_a_mno','_a_mtp','_a_mld','_a_nul']:
+                adbg_names.append('_b' + n)
+            for idx in range(len(adbg_feats_obf)):
+                adbg_names.append(f'_a_ft{idx}')
+                adbg_names.append(f'_b_a_ft{idx}')
+            _add_internal_syms(sym_map, adbg_names, a.seed, 0x3B, items)
         if file_sigs:
             fnames = []
             for g in file_sigs:
@@ -1837,17 +1907,12 @@ def main():
                 fnames.extend([f'_fsig_{safe_g}', f'_fscheck_{safe_g}'])
             _add_internal_syms(sym_map, fnames, a.seed, 0xF5, items)
 
+    ctor_base = a.constructor_base
     default_elf = 'split.so' if a.library else 'split.elf'
     elf_name = obfuscate_names([default_elf], a.seed)[default_elf] \
                if a.obfuscate_target else default_elf
 
     cflags_extra = ''
-    # -fvisibility=hidden 与 -flto 冲突：LTO 会把所有符号 internalize（含显式
-    # __attribute__((visibility("default"))) 的 CJSON_PUBLIC API），导致 .so
-    # 的 .dynsym 全空。因此：
-    #   - ELF 模式：仍用 -fvisibility=hidden（不链接 LTO 时无此问题）
-    #   - .so 模式（--library）：改用显式 __attribute__((visibility("hidden")))
-    #     打在内部去 static 函数上，CJSON_PUBLIC 的 default visibility 自然生效
     if a.visibility_hidden and not a.library:
         cflags_extra += ' -fvisibility=hidden'
     if a.lto: cflags_extra += ' -flto'
@@ -1888,6 +1953,11 @@ def main():
             print(f'    {jm["basename"]}.c: {jm["n"]} checks  '
                   f'ck={jm["ck"]}  panic={jm["panic"]}')
 
+    # v2.6.6: dry-run 提前退出
+    if a.dry_run:
+        print('\n[DRY-RUN] 未生成任何文件')
+        sys.exit(0)
+
     # ---- 清理输出目录 ----
     os.makedirs(a.output, exist_ok=True)
     for f in os.listdir(a.output):
@@ -1899,18 +1969,20 @@ def main():
     adbg_h_name    = file_map.get('adbg.h') if a.anti_debug else None
     junk_h_names = [file_map[f'{jm["basename"]}.h'] for jm in junk_modules] \
                    if a.junk else None
-    
+
     gen_common_h(items, a.output, file_map['common.h'], sym_map,
                  decrypt_h_name, adbg_h_name, junk_h_names)
     if has_common_defs:
         gen_common_c(items, a.output, file_map['common.c'],
-                     file_map['common.h'], sym_map, global_arrays, file_sigs)
+                     file_map['common.h'], sym_map, global_arrays, file_sigs,
+                     ctor_base=ctor_base)
     for g in groups:
         if g == a.common: continue
         gen_group_h(g, items, group_deps, a.output,
                     file_map[f'{g}.h'], file_map, sym_map)
         gen_group_c(g, items, a.output, file_map[f'{g}.c'],
-                    file_map[f'{g}.h'], sym_map, global_arrays, file_sigs)
+                    file_map[f'{g}.h'], sym_map, global_arrays, file_sigs,
+                    ctor_base=ctor_base)
 
     if a.encrypt_strings and unique_strings:
         gen_decrypt_h(a.output, file_map['decrypt.h'], len(unique_strings),
@@ -1921,17 +1993,22 @@ def main():
         kp = dump_keys(a.output, krot, unique_strings, encrypted_data, a.seed)
         print(f'  密钥已保存: {kp}')
     if a.anti_debug:
+        adbg_feats_call = [f.strip() for f in a.adbg_features.split(',') if f.strip()]
+        if not adbg_feats_call:
+            adbg_feats_call = ['frida-agent','libfrida-','gdb-server','libhook','frida']
         gen_antidebug_h(a.output, file_map['adbg.h'], sym_map=sym_map)
-        gen_antidebug_c(a.output, file_map['adbg.c'], sym_map=sym_map)
+        gen_antidebug_c(a.output, file_map['adbg.c'], sym_map=sym_map,
+                        features=adbg_feats_call,
+                        adbg_priority=a.adbg_priority)
     if a.junk:
         for jm in junk_modules:
             gen_junk_h(a.output, file_map[f'{jm["basename"]}.h'],
                        jm['ck'], jm['panic'], sym_map=sym_map,
-                       basename=jm['basename'])                  # ★ 新增
+                       basename=jm['basename'])
             gen_junk_c(a.output, file_map[f'{jm["basename"]}.c'],
                        jm['n'], jm['seed'], jm['table'], jm['expected'],
                        jm['panic_code'], jm['ck'], jm['panic'],
-                       sym_map=sym_map)
+                       sym_map=sym_map, ctor_base=ctor_base)
 
     ldflags = a.ldflags or detect_ldflags(items)
     src_dir = os.path.dirname(os.path.abspath(a.input))
